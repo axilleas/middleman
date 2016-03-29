@@ -158,7 +158,9 @@ module Middleman
         break if partial_file
       end
 
-      partial_file
+      @app.execute_callbacks(:render_partial, [partial_file]) if partial_file
+
+      partial_file || nil
     end
 
     def current_path
