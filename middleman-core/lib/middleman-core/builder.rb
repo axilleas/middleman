@@ -7,13 +7,14 @@ require 'digest/sha1'
 require 'middleman-core/rack'
 require 'middleman-core/callback_manager'
 require 'middleman-core/contracts'
+require 'middleman-core/dependencies'
 
 module Middleman
   class Builder
     extend Forwardable
     include Contracts
 
-    OutputResult = Struct.new(:path, :layouts, :partials)
+    OutputResult = Struct.new(:path, :source_path, :depends_on)
 
     # Make app & events available to `after_build` callbacks.
     attr_reader :app, :events
@@ -79,14 +80,17 @@ module Middleman
       ::Middleman::Profiling.start
 
       ::Middleman::Util.instrument 'builder.output' do
-        if @manifest && m = load_manifest!
-          incremental_resources = calculate_incremental(m)
+        files =
+        # if @manifest && m = load_manifest!
+        #   incremental_resources = calculate_incremental(m)
 
-          logger.debug '== Building files'
-          output_resources(incremental_resources)
-        else
+        #   logger.debug '== Building files'
+        #   output_resources(incremental_resources)
+        # else
           output_files
-        end
+        # end
+
+        build_manifest!(files) if @manifest && !@has_error
       end
 
       ::Middleman::Profiling.report('build')
@@ -101,7 +105,6 @@ module Middleman
         end
       end
 
-      build_manifest! if @manifest && !@has_error
 
       !@has_error
     end
@@ -115,6 +118,7 @@ module Middleman
       css_files = ::Middleman::Util.instrument 'builder.prerender.output' do
         resources = @app.sitemap.resources.select { |resource| resource.ext == '.css' }
         output_resources(resources)
+        resources
       end
 
       ::Middleman::Util.instrument 'builder.prerender.check-files' do
@@ -130,7 +134,7 @@ module Middleman
 
     # Find all the files we need to output and do so.
     # @return [Array<Resource>] List of resources that were output.
-    Contract ResourceList
+    Contract ArrayOf[OutputResult]
     def output_files
       logger.debug '== Building files'
 
@@ -151,16 +155,13 @@ module Middleman
       output_resources(resources)
     end
 
-    Contract ResourceList => ResourceList
+    Contract ResourceList => ArrayOf[OutputResult]
     def output_resources(resources)
       results = if @parallel
         ::Parallel.map(resources, &method(:output_resource))
       else
         resources.map(&method(:output_resource))
       end
-
-      @partial_files = results.reduce(Set.new) { |sum, r| r ? sum + r[:partials] : sum }
-      @layout_files = results.reduce(Set.new) { |sum, r| r ? sum + r[:layouts] : sum }
 
       @has_error = true if results.any? { |r| r == false }
 
@@ -179,7 +180,7 @@ module Middleman
         end
       end
 
-      resources
+      results
     end
 
     # Figure out the correct event mode.
@@ -248,15 +249,14 @@ module Middleman
       ::Middleman::Util.instrument 'builder.output.resource', path: File.basename(resource.destination_path) do
         output_file = @build_dir + resource.destination_path.gsub('%20', ' ')
 
-        layouts = Set.new
-        partials = Set.new
+        depends_on = Set.new
 
         @app.render_layout do |f|
-          layouts << f[:full_path]
+          depends_on << f[:full_path]
         end
 
         @app.render_partial do |f|
-          partials << f[:full_path]
+          depends_on << f[:full_path]
         end
 
         begin
@@ -278,7 +278,7 @@ module Middleman
           return false
         end
 
-        OutputResult.new(output_file, layouts, partials)
+        OutputResult.new(output_file.to_s, resource.destination_path, depends_on)
       end
     end
 
@@ -339,6 +339,8 @@ module Middleman
     def load_manifest!
       return nil unless File.exist?(MANIFEST_FILE)
 
+      deps = ::Middleman::Dependencies.new
+
       m = ::YAML.load(File.read(MANIFEST_FILE))
 
       all_files = Set.new(@app.files.files.map { |f| f[:full_path].relative_path_from(@app.root_path).to_s })
@@ -352,6 +354,11 @@ module Middleman
 
       @global_paths = Set.new(partial_and_layout_files) + ruby_files
 
+      # Add file refs
+      all_files.each do |f|
+        deps.record!(f, m[f])
+      end
+
       (all_files + ruby_files).select do |f|
         if m[f]
           dig = ::Digest::SHA1.file(f).to_s
@@ -360,7 +367,7 @@ module Middleman
           true
         end
       end
-    rescue StandardError, ::Psych::SyntaxError => error
+    rescue ::Psych::SyntaxError => error
       logger.error "Manifest file (#{MANIFEST_FILE}) was malformed."
     end
 
@@ -391,9 +398,15 @@ module Middleman
       end
     end
 
-    def build_manifest!
+    Contract ArrayOf[OutputResult] => Any
+    def build_manifest!(files)
+    require 'byebug'
+    byebug
       all_files = Set.new(@app.files.files.map { |f| f[:full_path].to_s })
-      ruby_files = Set.new(Dir[File.join(app.root, "**/*.rb")]) << File.expand_path("Gemfile.lock", @app.root)
+      ruby_files = Set.new(Dir[File.join(app.root, "**/*.rb")])
+
+      gemfile_path = File.expand_path("Gemfile.lock", @app.root)
+      ruby_files << gemfile_path if File.exist?(gemfile_path)
 
       manifest = (all_files + ruby_files).each_with_object({}) do |source_file, sum|
         path = Pathname(source_file).relative_path_from(@app.root_path).to_s
