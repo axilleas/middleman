@@ -16,6 +16,7 @@ docs
 .ruby-gemset
 .*.swp
 build
+manifest.yaml
 doc
 .yardoc
 tmp

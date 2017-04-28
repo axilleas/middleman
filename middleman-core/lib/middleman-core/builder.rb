@@ -2,14 +2,19 @@ require 'pathname'
 require 'fileutils'
 require 'tempfile'
 require 'parallel'
+require 'set'
+require 'digest/sha1'
 require 'middleman-core/rack'
 require 'middleman-core/callback_manager'
 require 'middleman-core/contracts'
+require 'middleman-core/dependencies'
 
 module Middleman
   class Builder
     extend Forwardable
     include Contracts
+
+    OutputResult = Struct.new(:path, :source_path, :depends_on)
 
     # Make app & events available to `after_build` callbacks.
     attr_reader :app, :events
@@ -22,6 +27,8 @@ module Middleman
 
     # Sort order, images, fonts, js/css and finally everything else.
     SORT_ORDER = %w(.png .jpeg .jpg .gif .bmp .svg .svgz .webp .ico .woff .woff2 .otf .ttf .eot .js .css).freeze
+
+    MANIFEST_FILE = 'manifest.yaml'
 
     # Create a new Builder instance.
     # @param [Middleman::Application] app The app to build.
@@ -38,6 +45,11 @@ module Middleman
       @glob = opts.fetch(:glob)
       @cleaning = opts.fetch(:clean)
       @parallel = opts.fetch(:parallel, true)
+      @manifest = opts.fetch(:manifest, false)
+      @cleaning = @glob = false if @manifest
+
+      @layout_files = Set.new
+      @partial_files = Set.new
 
       rack_app = ::Middleman::Rack.new(@app).to_app
       @rack = ::Rack::MockRequest.new(rack_app)
@@ -62,13 +74,23 @@ module Middleman
       end
 
       ::Middleman::Util.instrument 'builder.prerender' do
-        prerender_css
+        prerender_css unless @manifest
       end
 
       ::Middleman::Profiling.start
 
       ::Middleman::Util.instrument 'builder.output' do
-        output_files
+        files =
+        # if @manifest && m = load_manifest!
+        #   incremental_resources = calculate_incremental(m)
+
+        #   logger.debug '== Building files'
+        #   output_resources(incremental_resources)
+        # else
+          output_files
+        # end
+
+        build_manifest!(files) if @manifest && !@has_error
       end
 
       ::Middleman::Profiling.report('build')
@@ -83,6 +105,7 @@ module Middleman
         end
       end
 
+
       !@has_error
     end
 
@@ -95,6 +118,7 @@ module Middleman
       css_files = ::Middleman::Util.instrument 'builder.prerender.output' do
         resources = @app.sitemap.resources.select { |resource| resource.ext == '.css' }
         output_resources(resources)
+        resources
       end
 
       ::Middleman::Util.instrument 'builder.prerender.check-files' do
@@ -110,7 +134,7 @@ module Middleman
 
     # Find all the files we need to output and do so.
     # @return [Array<Resource>] List of resources that were output.
-    Contract ResourceList
+    Contract ArrayOf[OutputResult]
     def output_files
       logger.debug '== Building files'
 
@@ -131,7 +155,7 @@ module Middleman
       output_resources(resources)
     end
 
-    Contract ResourceList => ResourceList
+    Contract ResourceList => ArrayOf[OutputResult]
     def output_resources(resources)
       results = if @parallel
         ::Parallel.map(resources, &method(:output_resource))
@@ -143,20 +167,20 @@ module Middleman
 
       if @cleaning && !@has_error
         results.each do |p|
-          next unless p.exist?
+          next unless p[:path].exist?
 
           # handle UTF-8-MAC filename on MacOS
           cleaned_name = if RUBY_PLATFORM =~ /darwin/
-            p.to_s.encode('UTF-8', 'UTF-8-MAC')
+            p[:path].to_s.encode('UTF-8', 'UTF-8-MAC')
           else
-            p
+            p[:path]
           end
 
           @to_clean.delete(Pathname(cleaned_name))
         end
       end
 
-      resources
+      results
     end
 
     # Figure out the correct event mode.
@@ -168,7 +192,7 @@ module Middleman
       if !output_file.exist?
         :created
       else
-        FileUtils.compare_file(source.to_s, output_file.to_s) ? :identical : :updated
+        ::FileUtils.compare_file(source.to_s, output_file.to_s) ? :identical : :updated
       end
     end
 
@@ -220,10 +244,20 @@ module Middleman
     # Try to output a resource and capture errors.
     # @param [Middleman::Sitemap::Resource] resource The resource.
     # @return [void]
-    Contract IsA['Middleman::Sitemap::Resource'] => Or[Pathname, Bool]
+    Contract IsA['Middleman::Sitemap::Resource'] => Or[OutputResult, Bool]
     def output_resource(resource)
       ::Middleman::Util.instrument 'builder.output.resource', path: File.basename(resource.destination_path) do
         output_file = @build_dir + resource.destination_path.gsub('%20', ' ')
+
+        depends_on = Set.new
+
+        @app.render_layout do |f|
+          depends_on << f[:full_path]
+        end
+
+        @app.render_partial do |f|
+          depends_on << f[:full_path]
+        end
 
         begin
           if resource.binary?
@@ -244,7 +278,7 @@ module Middleman
           return false
         end
 
-        output_file
+        OutputResult.new(output_file.to_s, resource.destination_path, depends_on)
       end
     end
 
@@ -300,6 +334,87 @@ module Middleman
       @events[event_type] << target
 
       execute_callbacks(:on_build_event, [event_type, target, extra])
+    end
+
+    def load_manifest!
+      return nil unless File.exist?(MANIFEST_FILE)
+
+      deps = ::Middleman::Dependencies.new
+
+      m = ::YAML.load(File.read(MANIFEST_FILE))
+
+      all_files = Set.new(@app.files.files.map { |f| f[:full_path].relative_path_from(@app.root_path).to_s })
+      ruby_files = Set.new(Dir[File.join(app.root, "**/*.rb")].map { |f| Pathname(f).relative_path_from(@app.root_path).to_s }) << "Gemfile.lock"
+
+      locales_path = app.extensions[:i18n] && app.extensions[:i18n].options[:data]
+
+      partial_and_layout_files = all_files.select do |f|
+        f.start_with?(app.config[:layouts_dir] + "/") || f.split("/").any? { |d| d.start_with?("_") } || (locales_path && f.start_with?(locales_path + "/"))
+      end
+
+      @global_paths = Set.new(partial_and_layout_files) + ruby_files
+
+      # Add file refs
+      all_files.each do |f|
+        deps.record!(f, m[f])
+      end
+
+      (all_files + ruby_files).select do |f|
+        if m[f]
+          dig = ::Digest::SHA1.file(f).to_s
+          dig != m[f]
+        else
+          true
+        end
+      end
+    rescue ::Psych::SyntaxError => error
+      logger.error "Manifest file (#{MANIFEST_FILE}) was malformed."
+    end
+
+    def calculate_incremental(manifest)
+      logger.debug '== Calculating incremental build files'
+
+      if manifest.empty?
+        logger.debug "== No files changed"
+        return []
+      end
+
+      resources = @app.sitemap.resources.sort_by { |resource| SORT_ORDER.index(resource.ext) || 100 }
+
+      if changed = manifest.select { |p| @global_paths.include?(p) }
+        if changed.length > 0
+          logger.debug "== Global file changed: #{changed}"
+          return resources
+        end
+      end
+
+      resources.select do |r|
+        if r.file_descriptor
+          path = r.file_descriptor[:full_path].relative_path_from(@app.root_path).to_s
+          manifest.include?(path)
+        else
+          false
+        end
+      end
+    end
+
+    Contract ArrayOf[OutputResult] => Any
+    def build_manifest!(files)
+    require 'byebug'
+    byebug
+      all_files = Set.new(@app.files.files.map { |f| f[:full_path].to_s })
+      ruby_files = Set.new(Dir[File.join(app.root, "**/*.rb")])
+
+      gemfile_path = File.expand_path("Gemfile.lock", @app.root)
+      ruby_files << gemfile_path if File.exist?(gemfile_path)
+
+      manifest = (all_files + ruby_files).each_with_object({}) do |source_file, sum|
+        path = Pathname(source_file).relative_path_from(@app.root_path).to_s
+        sum[path] = ::Digest::SHA1.file(source_file).to_s
+      end
+
+      ::File.write(MANIFEST_FILE, manifest.to_yaml)
+      trigger(:created, MANIFEST_FILE)
     end
   end
 end

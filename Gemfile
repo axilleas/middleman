@@ -31,12 +31,12 @@ gem 'redcarpet', '>= 3.1', require: false
 gem 'rubydns', '~> 1.0.1', require: false
 
 # To test javascript
-gem 'poltergeist', '~> 1.8', require: false
-gem 'phantomjs', '~> 2.1.1.0', require: false
+gem 'poltergeist', '~> 1.9', require: false
+gem 'phantomjs', '~> 2.1.1', require: false
 
 # For less, note there is no compatible JS runtime for windows
 gem 'therubyrhino', '>= 2.0', platforms: :jruby
-gem 'therubyracer', '>= 0.12', platforms: :ruby
+gem 'therubyracer', '>= 0.12.1', platforms: :ruby
 
 # Code Quality
 gem 'rubocop', '~> 0.24', require: false

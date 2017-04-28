@@ -19,6 +19,10 @@ module Middleman::Cli
                  type: :boolean,
                  default: true,
                  desc: 'Output files in parallel (--no-parallel to disable)'
+    class_option :manifest,
+                 type: :boolean,
+                 default: false,
+                 desc: 'Use a manifest.yaml to optimize incremental builds'
     class_option :glob,
                  type: :string,
                  aliases: '-g',
@@ -71,7 +75,8 @@ module Middleman::Cli
         builder = Middleman::Builder.new(@app,
                                          glob: options['glob'],
                                          clean: options['clean'],
-                                         parallel: options['parallel'])
+                                         parallel: options['parallel'],
+                                         manifest: options['manifest'])
         builder.thor = self
         builder.on_build_event(&method(:on_event))
       end
