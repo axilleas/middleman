@@ -157,9 +157,9 @@ module Middleman
             layout_renderer = ::Middleman::FileRenderer.new(@app, layout_file[:relative_path].to_s)
             layout_renderer.render(locals, options, context) { content }
           end
-        else
-          content
         end
+      else
+        content
       end
 
       # Return result
